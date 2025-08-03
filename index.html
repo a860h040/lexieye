@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Pill Counter – Styled</title>
+  <title>Precision Pill Counter</title>
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet" />
   <style>
@@ -68,7 +68,7 @@
   </style>
 </head>
 <body>
-  <h1>💊 lexieye</h1>
+  <h1>💊 Precision Pill Counter</h1>
   <div class="pill-counter">
     <video id="video" autoplay playsinline></video>
     <canvas id="canvas"></canvas>
@@ -81,9 +81,29 @@
     let canvas = document.getElementById('canvas');
     let ctx = canvas.getContext('2d');
 
-    navigator.mediaDevices.getUserMedia({ video: true }).then(stream => {
-      video.srcObject = stream;
-    });
+    async function startBackCamera() {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(d => d.kind === 'videoinput');
+
+      let backCamera = videoDevices.find(device =>
+        device.label.toLowerCase().includes('back') ||
+        device.label.toLowerCase().includes('environment')
+      );
+
+      let constraints = {
+        video: backCamera
+          ? { deviceId: { exact: backCamera.deviceId } }
+          : { facingMode: { exact: "environment" } }
+      };
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+      } catch (err) {
+        console.error("Camera error:", err);
+        alert("Could not access back camera.");
+      }
+    }
 
     function captureAndCount() {
       canvas.width = video.videoWidth;
@@ -97,14 +117,12 @@
       let morph = new cv.Mat();
       let contours = new cv.MatVector();
       let hierarchy = new cv.Mat();
-
       let kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
 
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
       cv.GaussianBlur(gray, blurred, new cv.Size(7, 7), 1.5);
       cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 15, 5);
       cv.morphologyEx(thresh, morph, cv.MORPH_OPEN, kernel);
-
       cv.findContours(morph, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
       let count = 0;
@@ -112,27 +130,17 @@
       for (let i = 0; i < contours.size(); ++i) {
         let cnt = contours.get(i);
         let area = cv.contourArea(cnt);
-        if (area < 200 || area > 8000) {
-          cnt.delete();
-          continue;
-        }
+        if (area < 200 || area > 8000) { cnt.delete(); continue; }
 
         let perimeter = cv.arcLength(cnt, true);
         let circularity = 4 * Math.PI * area / (perimeter * perimeter);
-        if (circularity < 0.6) {
-          cnt.delete();
-          continue;
-        }
+        if (circularity < 0.6) { cnt.delete(); continue; }
 
         let hull = new cv.Mat();
         cv.convexHull(cnt, hull);
         let hullArea = cv.contourArea(hull);
         let solidity = area / hullArea;
-        if (solidity < 0.85) {
-          hull.delete();
-          cnt.delete();
-          continue;
-        }
+        if (solidity < 0.85) { hull.delete(); cnt.delete(); continue; }
 
         let M = cv.moments(cnt);
         let cx = M.m10 / M.m00;
@@ -148,9 +156,11 @@
       cv.imshow(canvas, src);
       document.getElementById("pillCount").innerText = "Detected Pills: " + count;
 
-      src.delete(); gray.delete(); blurred.delete(); thresh.delete(); morph.delete();
-      kernel.delete(); contours.delete(); hierarchy.delete();
+      src.delete(); gray.delete(); blurred.delete(); thresh.delete();
+      morph.delete(); kernel.delete(); contours.delete(); hierarchy.delete();
     }
+
+    window.onload = startBackCamera;
   </script>
 </body>
 </html>
