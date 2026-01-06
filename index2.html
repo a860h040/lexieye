@@ -1,0 +1,1004 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>LexiEye — Live Pill Counter (WHITE PAPER ultra-accurate)</title>
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    :root{--primary:#007acc;--accent:#d9eaff;--bg:#fdfefe;--glass:rgba(255,255,255,0.2);--border-glass:rgba(255,255,255,0.4);--text:#333}
+    *{box-sizing:border-box}
+    body{font-family:Poppins,system-ui,Segoe UI,Arial,sans-serif;background:radial-gradient(circle at 40% 40%,var(--bg),#e0f4ff);color:var(--text);margin:0;padding:20px}
+    h1{ text-align:center; font-size:2.2rem; color:var(--primary); margin:0 0 12px }
+    .wrap{ max-width:1000px; margin:auto; border-radius:24px; padding:16px; background:var(--glass); border:1px solid var(--border-glass); backdrop-filter:blur(20px) }
+    .controls{ display:flex; gap:10px; align-items:center; flex-wrap:wrap }
+    .controls .spacer{ flex:1 }
+    .btn{ background:var(--primary); color:#fff; border:none; border-radius:16px; padding:10px 14px; cursor:pointer }
+    .btn[disabled]{ opacity:.6; cursor:not-allowed }
+    .pill{ display:inline-block; padding:4px 10px; border-radius:12px; background:#e8f4ff; border:1px solid #cfe7ff; font-size:1.1rem }
+    .err{ color:#b00020; font-size:.95rem; min-height:1.2em }
+
+    .feed{ position:relative; width:100%; max-width:960px; margin-top:10px }
+    video{ display:block; width:100%; height:auto; border-radius:18px; border:2px solid var(--primary) }
+    #overlay{ position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; border-radius:18px }
+    #count{ font-size:clamp(3rem,12vw,10rem); font-weight:800; line-height:1; font-variant-numeric:tabular-nums; letter-spacing:.02em }
+    #fps{ font-size:1rem }
+
+    .slider-wrap{ display:flex; align-items:center; gap:10px; background:#eef7ff; border:1px solid #cfe7ff; padding:6px 10px; border-radius:14px }
+    .slider-wrap label{ font-weight:600; font-size:.95rem }
+    input[type=range]{ -webkit-appearance:none; appearance:none; width:180px; height:6px; border-radius:999px; background:#d9eaff; outline:none }
+    input[type=range]::-webkit-slider-thumb{ -webkit-appearance:none; appearance:none; width:18px; height:18px; border-radius:50%; background:var(--primary); cursor:pointer }
+    input[type=range]::-moz-range-thumb{ width:18px; height:18px; border-radius:50%; background:var(--primary); cursor:pointer }
+  </style>
+</head>
+<body>
+  <h1>LexiEye</h1>
+  <div class="wrap">
+    <div class="controls">
+      <button id="startBtn" class="btn" disabled>Enable Camera & Start</button>
+
+      <div class="spacer"></div>
+
+      <div class="slider-wrap">
+        <label for="bright">Brightness</label>
+        <input id="bright" type="range" min="-60" max="60" step="1" value="0" />
+        <span class="pill" id="brightVal">0</span>
+      </div>
+
+      <span class="pill"><b id="count">0</b></span>
+      <span class="pill" id="fps">0 fps</span>
+
+      <button id="recountBtn" class="btn">Recount Final</button>
+    </div>
+
+    <div class="err" id="err"></div>
+
+    <div class="feed">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+  </div>
+
+<script>
+/*
+  LexiEye — WHITE PAPER ultra-accurate
+  Key upgrades for WHITE PAPER:
+  - LAB paper model (sample corners) => non-paper mask (filters paper texture/glare)
+  - Glare removal only when glare is ON PAPER (won't erase pills)
+  - Flat-field illumination normalization + CLAHE
+  - Watershed separation for touching pills
+  - Track "hits" confidence (seen multiple times) before counting
+  - Border guard (ignore edge artifacts)
+*/
+
+const startBtn=document.getElementById('startBtn');
+const recountBtn=document.getElementById('recountBtn');
+const errEl=document.getElementById('err');
+const video=document.getElementById('video');
+const overlay=document.getElementById('overlay');
+const octx=overlay.getContext('2d');
+const countEl=document.getElementById('count');
+const fpsEl=document.getElementById('fps');
+const brightEl=document.getElementById('bright');
+const brightVal=document.getElementById('brightVal');
+
+let stream=null, running=false, lastTick=performance.now(), frames=0;
+let frameIdx=0;
+
+const COUNT_DELAY_MS = 2500; // let camera settle
+let countGateUntil = 0;
+
+// Live behavior
+const LIVE_DROP_MS = 1200;
+
+// Hit-confidence tracking
+const HIT_DECAY = 0.84;
+const HIT_ADD_WEAK = 1.0;
+const HIT_ADD_STRONG = 2.0;
+const HIT_COUNT_MIN = 3.2;
+const HIT_MAX = 12.0;
+
+// Display smoothing
+const DISPLAY_WIN = 13;
+const displayHist=[];
+
+// processing size
+const PROC_MAX_W=440;
+let procW=0,procH=0,vidW=0,vidH=0,sX=1,sY=1;
+
+// perf throttles
+const PERF={GRAD_EVERY:2,CLAHE_EVERY:2,LAB_EVERY:3,GLARE_EVERY:3,WATERSHED_EVERY:2};
+
+// kernels & helpers
+let kSmall, kBig, clahe;
+
+// mats
+let src,rgb,hsv,lab,gray,blur;
+let bgIllum,norm;
+let maskOtsu,maskAdapt,fused;
+let glareMask;
+let nonPaper, nonPaperDil, paperMask;
+let grad, gradBin, sobelX, sobelY, absX, absY;
+let dt, dtNorm, sureFgF, sureFg, sureBg, unknown, markers, wsMask, plusOne32;
+let contours, hierarchy, hsvMask;
+
+const cache={nonPaper:null,paperMask:null,glareOnPaper:null,grad:null,gradBin:null};
+const sizePrior={Rv:null};
+
+const work=document.createElement('canvas');
+const wctx=work.getContext('2d');
+
+function showErr(m){ errEl.textContent=m||''; if(m) console.error(m); }
+function odd(n){ return (n%2)?n:n+1; }
+function median(a){
+  if(!a.length) return 0;
+  const b=[...a].sort((x,y)=>x-y);
+  const m=Math.floor(b.length/2);
+  return b.length%2?b[m]:(b[m-1]+b[m])/2;
+}
+
+async function startCamera(){
+  try{
+    const inFrame = (window.top !== window.self);
+    const pol = (document.featurePolicy || document.permissionsPolicy);
+    let camAllowed = true;
+    if(pol && typeof pol.allowsFeature === 'function') camAllowed = pol.allowsFeature('camera');
+    if(inFrame && camAllowed === false){
+      showErr('Camera is blocked in this embedded preview. Open this file in its own tab or serve it over HTTPS/localhost.');
+      return false;
+    }
+  }catch{}
+
+  errEl.textContent='';
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showErr('Camera not supported in this browser. Use Safari/Chrome over HTTPS.');
+    return false;
+  }
+  if(!window.isSecureContext && location.hostname!=='localhost' && location.hostname!=='127.0.0.1'){
+    showErr('This page must be served over HTTPS or localhost for the camera to work.');
+    return false;
+  }
+
+  const tries=[
+    {video:{facingMode:'environment', width:{ideal:1280}, height:{ideal:720}}, audio:false},
+    {video:{facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}}, audio:false},
+    {video:{facingMode:'environment'}, audio:false},
+    {video:{facingMode:{ideal:'environment'}, width:{ideal:960}, height:{ideal:540}}, audio:false},
+    {video:{facingMode:'user'}, audio:false},
+    {video:true, audio:false}
+  ];
+
+  try{
+    const devs=await navigator.mediaDevices.enumerateDevices();
+    const back=devs.find(d=>d.kind==='videoinput' && /back|environment/i.test(d.label||''));
+    if(back) tries.unshift({video:{deviceId:{exact:back.deviceId}, width:{ideal:1280}, height:{ideal:720}}, audio:false});
+  }catch{}
+
+  let lastErr=null;
+  for(const c of tries){
+    try{
+      stream=await navigator.mediaDevices.getUserMedia(c);
+      video.srcObject=stream;
+      video.setAttribute('playsinline','true');
+      video.playsInline=true; video.muted=true;
+      await video.play().catch(()=>{});
+
+      try{
+        const track=stream.getVideoTracks()[0];
+        const caps=track.getCapabilities?track.getCapabilities():{};
+        const adv=[];
+        if(caps.exposureMode) adv.push({exposureMode:'continuous'});
+        if(caps.whiteBalanceMode) adv.push({whiteBalanceMode:'continuous'});
+        if(caps.focusMode) adv.push({focusMode:'continuous'});
+        if(adv.length) track.applyConstraints({advanced:adv}).catch(()=>{});
+      }catch{}
+
+      return true;
+    }catch(e){
+      console.warn('gUM fail',c,e);
+      lastErr=e;
+    }
+  }
+
+  showErr('Could not start the camera. '+ (lastErr? (lastErr.name+(lastErr.message?(': '+lastErr.message):'')) : 'Use HTTPS or localhost.'));
+  return false;
+}
+
+function updateFps(){
+  frames++;
+  const now=performance.now();
+  if(now-lastTick>=1000){
+    fpsEl.textContent=`${frames} fps`;
+    frames=0; lastTick=now;
+  }
+}
+
+// software brightness fallback
+let userBright = 0;
+
+function allocAll(){
+  vidW=video.videoWidth||640;
+  vidH=video.videoHeight||480;
+
+  overlay.width=vidW;
+  overlay.height=vidH;
+
+  procW=Math.min(vidW,PROC_MAX_W);
+  procH=Math.round(vidH*(procW/vidW));
+  work.width=procW;
+  work.height=procH;
+
+  sX=vidW/procW;
+  sY=vidH/procH;
+
+  const cleanup=[
+    src,rgb,hsv,lab,gray,blur,bgIllum,norm,maskOtsu,maskAdapt,fused,glareMask,
+    nonPaper,nonPaperDil,paperMask,grad,gradBin,sobelX,sobelY,absX,absY,
+    dt,dtNorm,sureFgF,sureFg,sureBg,unknown,markers,wsMask,plusOne32,contours,hierarchy,hsvMask,
+    kSmall,kBig,clahe
+  ];
+  cleanup.forEach(m=>{ try{m&&m.delete&&m.delete()}catch{} });
+
+  src=new cv.Mat(procH,procW,cv.CV_8UC4);
+  rgb=new cv.Mat(procH,procW,cv.CV_8UC3);
+  hsv=new cv.Mat(procH,procW,cv.CV_8UC3);
+  lab=new cv.Mat(procH,procW,cv.CV_8UC3);
+  gray=new cv.Mat(procH,procW,cv.CV_8UC1);
+  blur=new cv.Mat(procH,procW,cv.CV_8UC1);
+
+  bgIllum=new cv.Mat(procH,procW,cv.CV_8UC1);
+  norm=new cv.Mat(procH,procW,cv.CV_8UC1);
+
+  maskOtsu=new cv.Mat(procH,procW,cv.CV_8UC1);
+  maskAdapt=new cv.Mat(procH,procW,cv.CV_8UC1);
+  fused=new cv.Mat(procH,procW,cv.CV_8UC1);
+
+  glareMask=new cv.Mat(procH,procW,cv.CV_8UC1);
+
+  nonPaper=new cv.Mat(procH,procW,cv.CV_8UC1);
+  nonPaperDil=new cv.Mat(procH,procW,cv.CV_8UC1);
+  paperMask=new cv.Mat(procH,procW,cv.CV_8UC1);
+
+  grad=new cv.Mat(procH,procW,cv.CV_8UC1);
+  gradBin=new cv.Mat(procH,procW,cv.CV_8UC1);
+
+  dt=new cv.Mat(procH,procW,cv.CV_32F);
+  dtNorm=new cv.Mat(procH,procW,cv.CV_32F);
+  sureFgF=new cv.Mat(procH,procW,cv.CV_32F);
+  sureFg=new cv.Mat(procH,procW,cv.CV_8UC1);
+  sureBg=new cv.Mat(procH,procW,cv.CV_8UC1);
+  unknown=new cv.Mat(procH,procW,cv.CV_8UC1);
+  markers=new cv.Mat(procH,procW,cv.CV_32S);
+  wsMask=new cv.Mat(procH,procW,cv.CV_8UC1);
+  plusOne32=new cv.Mat(procH,procW,cv.CV_32S,new cv.Scalar(1));
+
+  contours=new cv.MatVector();
+  hierarchy=new cv.Mat();
+  hsvMask=new cv.Mat(procH,procW,cv.CV_8UC1);
+
+  const ks=odd(Math.max(3,Math.round(Math.min(procW,procH)*0.018)));
+  const kb=odd(Math.max(11,Math.round(Math.min(procW,procH)*0.09)));
+  kSmall=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(ks,ks));
+  kBig=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(kb,kb));
+
+  try{ clahe=cv.createCLAHE(2.2,new cv.Size(8,8)); }catch{}
+
+  // reset caches
+  try{
+    cache.nonPaper&&cache.nonPaper.delete(); cache.nonPaper=null;
+    cache.paperMask&&cache.paperMask.delete(); cache.paperMask=null;
+    cache.glareOnPaper&&cache.glareOnPaper.delete(); cache.glareOnPaper=null;
+    cache.grad&&cache.grad.delete(); cache.grad=null;
+    cache.gradBin&&cache.gradBin.delete(); cache.gradBin=null;
+  }catch{}
+
+  displayHist.length=0;
+  sizePrior.Rv=null;
+}
+
+// ===== WHITE PAPER LAB MODEL =====
+function samplePaperLabMean(){
+  const w = Math.max(8, Math.round(procW*0.09));
+  const h = Math.max(8, Math.round(procH*0.09));
+  const rects = [
+    new cv.Rect(0,0,w,h),
+    new cv.Rect(procW-w,0,w,h),
+    new cv.Rect(0,procH-h,w,h),
+    new cv.Rect(procW-w,procH-h,w,h)
+  ];
+  let L=0,A=0,B=0;
+  for(const r of rects){
+    const roi = lab.roi(r);
+    const m = cv.mean(roi);
+    L += m[0]; A += m[1]; B += m[2];
+    roi.delete();
+  }
+  return [L/4, A/4, B/4];
+}
+
+function buildNonPaperMaskLab(){
+  const [Lp,Ap,Bp] = samplePaperLabMean();
+
+  const chs = new cv.MatVector();
+  cv.split(lab, chs);
+  const Lch = chs.get(0), Ach = chs.get(1), Bch = chs.get(2);
+
+  const Lc = new cv.Mat(procH,procW,cv.CV_8UC1,new cv.Scalar(Lp));
+  const Ac = new cv.Mat(procH,procW,cv.CV_8UC1,new cv.Scalar(Ap));
+  const Bc = new cv.Mat(procH,procW,cv.CV_8UC1,new cv.Scalar(Bp));
+
+  const dL = new cv.Mat(), dA = new cv.Mat(), dB = new cv.Mat();
+  cv.absdiff(Lch, Lc, dL);
+  cv.absdiff(Ach, Ac, dA);
+  cv.absdiff(Bch, Bc, dB);
+
+  const d = new cv.Mat();
+  cv.add(dL, dA, d);
+  cv.add(d, dB, d);
+
+  const mean = new cv.Mat(), std = new cv.Mat();
+  cv.meanStdDev(d, mean, std);
+  const mu = mean.doubleAt(0,0);
+  const sd = std.doubleAt(0,0);
+  const thr = Math.max(18, Math.min(60, mu + 1.25*sd));
+
+  cv.threshold(d, nonPaper, thr, 255, cv.THRESH_BINARY);
+
+  cv.morphologyEx(nonPaper, nonPaper, cv.MORPH_OPEN, kSmall);
+  cv.morphologyEx(nonPaper, nonPaper, cv.MORPH_CLOSE, kSmall);
+
+  const kd = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(7,7));
+  cv.dilate(nonPaper, nonPaperDil, kd);
+  kd.delete();
+
+  cv.bitwise_not(nonPaper, paperMask);
+
+  cache.nonPaper && cache.nonPaper.delete();
+  cache.paperMask && cache.paperMask.delete();
+  cache.nonPaper = nonPaperDil.clone();
+  cache.paperMask = paperMask.clone();
+
+  // cleanup
+  Lch.delete(); Ach.delete(); Bch.delete(); chs.delete();
+  Lc.delete(); Ac.delete(); Bc.delete();
+  dL.delete(); dA.delete(); dB.delete(); d.delete();
+  mean.delete(); std.delete();
+}
+
+// ===== GLARE (ON PAPER ONLY) =====
+function buildGlareOnPaperMask(){
+  const chs=new cv.MatVector();
+  cv.split(hsv,chs);
+  const S=chs.get(1), V=chs.get(2);
+
+  const hiV=new cv.Mat(), loS=new cv.Mat();
+  cv.threshold(V,hiV,242,255,cv.THRESH_BINARY);
+  cv.threshold(S,loS,30,255,cv.THRESH_BINARY_INV);
+  cv.bitwise_and(hiV,loS,glareMask);
+
+  const glareOnPaper=new cv.Mat();
+  cv.bitwise_and(glareMask, cache.paperMask || paperMask, glareOnPaper);
+
+  const k=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(7,7));
+  cv.dilate(glareOnPaper,glareOnPaper,k);
+  k.delete();
+
+  cache.glareOnPaper && cache.glareOnPaper.delete();
+  cache.glareOnPaper = glareOnPaper.clone();
+
+  // cleanup
+  hiV.delete(); loS.delete();
+  S.delete(); V.delete(); chs.delete();
+  glareOnPaper.delete();
+}
+
+// ===== GRADIENTS =====
+function buildGradients(){
+  if((frameIdx%PERF.GRAD_EVERY)!==0 && cache.grad && cache.gradBin){
+    grad.delete(); gradBin.delete();
+    grad = cache.grad.clone();
+    gradBin = cache.gradBin.clone();
+    return;
+  }
+
+  sobelX && sobelX.delete(); sobelY && sobelY.delete();
+  absX && absX.delete(); absY && absY.delete();
+
+  sobelX=new cv.Mat(); sobelY=new cv.Mat();
+  absX=new cv.Mat(); absY=new cv.Mat();
+
+  cv.Sobel(blur,sobelX,cv.CV_16S,1,0,3);
+  cv.Sobel(blur,sobelY,cv.CV_16S,0,1,3);
+  cv.convertScaleAbs(sobelX,absX);
+  cv.convertScaleAbs(sobelY,absY);
+
+  grad.delete(); gradBin.delete();
+  grad=new cv.Mat(); gradBin=new cv.Mat();
+  cv.addWeighted(absX,0.5,absY,0.5,0,grad);
+
+  const gMean=cv.mean(grad)[0];
+  cv.threshold(grad,gradBin,Math.max(20,gMean+2),255,cv.THRESH_BINARY);
+
+  cache.grad && cache.grad.delete();
+  cache.gradBin && cache.gradBin.delete();
+  cache.grad = grad.clone();
+  cache.gradBin = gradBin.clone();
+}
+
+function ringEdgeOK(cx,cy,r){
+  const EDGE_RING_MIN_PX=2, EDGE_RING_THICK=0.22, EDGE_MIN_COVER=0.15;
+  const R=Math.max(3,Math.round(r));
+  const t=Math.max(EDGE_RING_MIN_PX,Math.round(R*EDGE_RING_THICK));
+  const x0=Math.max(0,Math.round(cx-R-t));
+  const y0=Math.max(0,Math.round(cy-R-t));
+  const w=Math.min(procW-x0,2*(R+t)+1);
+  const h=Math.min(procH-y0,2*(R+t)+1);
+
+  const cxr=Math.round(R+t), cyr=cxr;
+  const ring=cv.Mat.zeros(h,w,cv.CV_8UC1);
+  const inner=cv.Mat.zeros(h,w,cv.CV_8UC1);
+  cv.circle(ring,new cv.Point(cxr,cyr),R+t,new cv.Scalar(255),-1);
+  cv.circle(inner,new cv.Point(cxr,cyr),Math.max(1,R-t),new cv.Scalar(255),-1);
+  cv.subtract(ring,inner,ring);
+
+  const gROI=gradBin.roi(new cv.Rect(x0,y0,w,h));
+  const inter=new cv.Mat();
+  cv.bitwise_and(gROI,ring,inter);
+
+  const c1=cv.countNonZero(inter), c0=cv.countNonZero(ring);
+  ring.delete(); inner.delete(); inter.delete(); gROI.delete();
+  return (c1/Math.max(1,c0))>EDGE_MIN_COVER;
+}
+
+function regionContrastOK(cx,cy,r){
+  const R=Math.max(4,Math.round(r));
+  const t=Math.max(2,Math.round(R*0.25));
+  const x0=Math.max(0,Math.round(cx-R-t-2));
+  const y0=Math.max(0,Math.round(cy-R-t-2));
+  const w=Math.min(procW-x0,2*(R+t)+5);
+  const h=Math.min(procH-y0,2*(R+t)+5);
+  const cxr=Math.round((cx-x0)), cyr=Math.round((cy-y0));
+
+  const inner=cv.Mat.zeros(h,w,cv.CV_8UC1), outer=cv.Mat.zeros(h,w,cv.CV_8UC1);
+  cv.circle(inner,new cv.Point(cxr,cyr),Math.max(2,R-1),new cv.Scalar(255),-1);
+  cv.circle(outer,new cv.Point(cxr,cyr),R+t,new cv.Scalar(255),-1);
+  const ring=new cv.Mat(); cv.subtract(outer,inner,ring);
+
+  const gROI=gray.roi(new cv.Rect(x0,y0,w,h));
+  const mIn=new cv.Mat(), sIn=new cv.Mat();
+  cv.meanStdDev(gROI,mIn,sIn,inner);
+  const mOut=new cv.Mat(), sOut=new cv.Mat();
+  cv.meanStdDev(gROI,mOut,sOut,ring);
+
+  const meanIn=mIn.doubleAt(0,0), stdIn=sIn.doubleAt(0,0);
+  const meanOut=mOut.doubleAt(0,0), stdOut=sOut.doubleAt(0,0);
+
+  inner.delete(); outer.delete(); ring.delete(); gROI.delete();
+  mIn.delete(); sIn.delete(); mOut.delete(); sOut.delete();
+
+  const noise=stdOut;
+  const minGap=Math.max(6,1.6*noise);
+  const maxStdIn=Math.max(58,1.0*noise+28);
+  return (meanIn-meanOut)>=minGap && stdIn<maxStdIn;
+}
+
+function choosePolarityAndThreshold(){
+  const sceneMean = cv.mean(blur)[0];
+  const preferInv = sceneMean > 150;
+
+  const t1 = preferInv ? (cv.THRESH_BINARY_INV+cv.THRESH_OTSU) : (cv.THRESH_BINARY+cv.THRESH_OTSU);
+  const t2 = preferInv ? (cv.THRESH_BINARY+cv.THRESH_OTSU) : (cv.THRESH_BINARY_INV+cv.THRESH_OTSU);
+
+  const tmp1=new cv.Mat(); const tmp2=new cv.Mat();
+  cv.threshold(blur,tmp1,0,255,t1);
+  cv.threshold(blur,tmp2,0,255,t2);
+
+  function score(m){
+    const clean=new cv.Mat();
+    cv.morphologyEx(m,clean,cv.MORPH_OPEN,kSmall);
+    const vec=new cv.MatVector(); const hier=new cv.Mat();
+    cv.findContours(clean,vec,hier,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+    const total=clean.rows*clean.cols;
+    const lo=total*0.0007, hi=total*0.22;
+    let good=0;
+    for(let i=0;i<vec.size();i++){
+      const a=cv.contourArea(vec.get(i));
+      if(a>lo && a<hi) good++;
+    }
+    clean.delete(); vec.delete(); hier.delete();
+    return good;
+  }
+
+  const s1 = score(tmp1);
+  const s2 = score(tmp2);
+
+  if(s1>=s2) tmp1.copyTo(maskOtsu);
+  else tmp2.copyTo(maskOtsu);
+
+  tmp1.delete(); tmp2.delete();
+}
+
+// Watershed split (FIXED: compare uses Mat, not scalar)
+function watershedSplit(inMask){
+  cv.dilate(inMask, sureBg, kSmall, new cv.Point(-1,-1), 2);
+
+  cv.distanceTransform(inMask, dt, cv.DIST_L2, 3);
+  cv.normalize(dt, dtNorm, 0, 1, cv.NORM_MINMAX);
+
+  const m=new cv.Mat(), s=new cv.Mat();
+  cv.meanStdDev(dtNorm, m, s);
+  const mu=m.doubleAt(0,0), sd=s.doubleAt(0,0);
+  m.delete(); s.delete();
+
+  const fgThr = Math.max(0.26, Math.min(0.42, mu + 0.65*sd));
+
+  // IMPORTANT: threshold output has same type as dtNorm (CV_32F)
+  cv.threshold(dtNorm, sureFgF, fgThr, 1.0, cv.THRESH_BINARY);
+  sureFgF.convertTo(sureFg, cv.CV_8U, 255);
+
+  cv.connectedComponents(sureFg, markers, 8, cv.CV_32S);
+
+  // markers = markers + 1  (background becomes 1)
+  cv.add(markers, plusOne32, markers);
+
+  // unknown region => 0 in markers
+  cv.subtract(sureBg, sureFg, unknown);
+  markers.setTo(new cv.Scalar(0), unknown);
+
+  cv.watershed(rgb, markers);
+
+  // FIX: OpenCV.js compare() needs Mat, not number:
+  // wsMask = markers > 1
+  cv.compare(markers, plusOne32, wsMask, cv.CMP_GT);
+
+  cv.morphologyEx(wsMask, wsMask, cv.MORPH_OPEN, kSmall);
+  cv.morphologyEx(wsMask, wsMask, cv.MORPH_CLOSE, kSmall);
+
+  return wsMask;
+}
+
+function hsvBrightHintMaskNonPaper(){
+  const chs=new cv.MatVector(); cv.split(hsv,chs);
+  const S=chs.get(1), V=chs.get(2);
+
+  const meanV=cv.mean(V)[0];
+  const vMin=Math.max(50,Math.round(meanV-10));
+  const sMax=185;
+
+  const vMask=new cv.Mat(), sMask=new cv.Mat();
+  cv.threshold(V,vMask,vMin,255,cv.THRESH_BINARY);
+  cv.threshold(S,sMask,sMax,255,cv.THRESH_BINARY_INV);
+  cv.bitwise_and(vMask,sMask,hsvMask);
+
+  cv.bitwise_and(hsvMask, cache.nonPaper || nonPaperDil, hsvMask);
+  cv.morphologyEx(hsvMask,hsvMask,cv.MORPH_OPEN,kSmall);
+
+  vMask.delete(); sMask.delete();
+  S.delete(); V.delete(); chs.delete();
+}
+
+// Tracking
+const tracker={tracks:[], nextId:1};
+
+function decayHits(){
+  for(const t of tracker.tracks){
+    t.hits = Math.max(0, (t.hits||0) * HIT_DECAY);
+  }
+}
+
+function assignTracks(dets){
+  const now=performance.now();
+  decayHits();
+
+  const maxDist=Math.min(vidW,vidH)*0.06;
+
+  for(const t of tracker.tracks) t.matched=false;
+
+  for(const d of dets){
+    let best=null, bd=1e9;
+    for(const t of tracker.tracks){
+      const dd=Math.hypot(d.x-t.x,d.y-t.y);
+      if(dd<bd && dd<maxDist){ best=t; bd=dd; }
+    }
+    if(best){
+      best.x=0.7*best.x+0.3*d.x;
+      best.y=0.7*best.y+0.3*d.y;
+      best.r1=0.7*(best.r1||d.r1)+0.3*d.r1;
+      best.r2=0.7*(best.r2||d.r2)+0.3*d.r2;
+      best.a=d.a;
+      best.type=d.type;
+      best.seen=now;
+      best.matched=true;
+      best.age=(best.age||0)+1;
+      best.hits = Math.min(HIT_MAX, (best.hits||0) + (d.strong?HIT_ADD_STRONG:HIT_ADD_WEAK));
+    }else{
+      tracker.tracks.push({
+        id:tracker.nextId++,
+        x:d.x,y:d.y,r1:d.r1,r2:d.r2,a:d.a,
+        type:d.type||'circle',
+        seen:now,matched:true,age:1,
+        hits: (d.strong?HIT_ADD_STRONG:HIT_ADD_WEAK)
+      });
+    }
+  }
+
+  tracker.tracks = tracker.tracks.filter(t=>{
+    const life = now-(t.seen||0);
+    if(life > LIVE_DROP_MS*3) return false;
+    if((t.hits||0) < 0.35 && life > 900) return false;
+    return true;
+  });
+}
+
+function syncIfNeeded(){
+  if(!video.videoWidth) return false;
+  if(overlay.width!==video.videoWidth || work.width===0){ allocAll(); return true; }
+  return false;
+}
+
+function process(){
+  if(!running) return;
+
+  try{
+    if(!video.videoWidth){ requestAnimationFrame(process); return; }
+    syncIfNeeded();
+
+    // read frame
+    wctx.drawImage(video,0,0,procW,procH);
+    try{ src && src.delete && src.delete(); }catch{}
+    src=cv.imread(work);
+
+    cv.cvtColor(src,rgb,cv.COLOR_RGBA2RGB);
+    cv.cvtColor(rgb,hsv,cv.COLOR_RGB2HSV);
+    cv.cvtColor(rgb,lab,cv.COLOR_RGB2Lab);
+    cv.cvtColor(rgb,gray,cv.COLOR_RGB2GRAY);
+
+    // illumination normalization
+    const bgK = odd(Math.max(31, Math.min(91, Math.round(Math.min(procW,procH)*0.20))));
+    cv.GaussianBlur(gray,bgIllum,new cv.Size(bgK,bgK),0,0,cv.BORDER_DEFAULT);
+    cv.divide(gray,bgIllum,norm,255);
+
+    if(clahe && (frameIdx%PERF.CLAHE_EVERY)===0){
+      try{ clahe.apply(norm,norm); }catch{}
+    }
+    if(userBright!==0){ cv.convertScaleAbs(norm,norm,1.0,userBright); }
+    norm.copyTo(gray);
+
+    cv.GaussianBlur(gray,blur,new cv.Size(5,5),1.05,1.05);
+
+    // paper model + glare
+    if((frameIdx%PERF.LAB_EVERY)===0 || !cache.nonPaper || !cache.paperMask){
+      buildNonPaperMaskLab();
+    }
+    if((frameIdx%PERF.GLARE_EVERY)===0 || !cache.glareOnPaper){
+      buildGlareOnPaperMask();
+    }
+
+    // gradients
+    buildGradients();
+
+    // threshold pipeline
+    choosePolarityAndThreshold();
+
+    const sceneMean = cv.mean(blur)[0];
+    const inv = sceneMean > 150;
+    const block=odd(Math.max(11,Math.round(Math.min(procW,procH)*0.07)));
+    cv.adaptiveThreshold(
+      blur,
+      maskAdapt,
+      255,
+      cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+      inv ? cv.THRESH_BINARY_INV : cv.THRESH_BINARY,
+      block,
+      6
+    );
+
+    cv.bitwise_and(maskOtsu, maskAdapt, fused);
+
+    // remove glare-on-paper
+    if(cache.glareOnPaper){
+      const invGlare=new cv.Mat();
+      cv.bitwise_not(cache.glareOnPaper, invGlare);
+      cv.bitwise_and(fused, invGlare, fused);
+      invGlare.delete();
+    }
+
+    // keep only non-paper
+    cv.bitwise_and(fused, cache.nonPaper || nonPaperDil, fused);
+
+    // hint
+    if(frameIdx>6){
+      hsvBrightHintMaskNonPaper();
+      cv.bitwise_or(fused, hsvMask, fused);
+    }
+
+    cv.morphologyEx(fused,fused,cv.MORPH_OPEN,kSmall);
+    cv.morphologyEx(fused,fused,cv.MORPH_CLOSE,kSmall);
+
+    // watershed split (every N frames)
+    const finalMask = ((frameIdx%PERF.WATERSHED_EVERY)===0) ? watershedSplit(fused) : wsMask;
+
+    // contours
+    contours.delete(); contours=new cv.MatVector();
+    hierarchy.delete(); hierarchy=new cv.Mat();
+    cv.findContours(finalMask,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+
+    const dets=[];
+    const eqR=[];
+
+    const expectedRv = sizePrior.Rv || (Math.min(vidW,vidH)*0.045);
+    const expectedRp = expectedRv / Math.sqrt((sX+sY)/2);
+    const minArea = Math.PI*Math.pow(expectedRp*0.32,2);
+    const maxArea = Math.PI*Math.pow(expectedRp*3.1,2);
+
+    const gMean=cv.mean(gray)[0];
+
+    for(let i=0;i<contours.size();i++){
+      const cnt=contours.get(i);
+      const area=cv.contourArea(cnt);
+      if(area < Math.max(16, minArea*0.50) || area > maxArea*1.25){ cnt.delete(); continue; }
+
+      const rect=cv.boundingRect(cnt);
+      if(rect.width<5 || rect.height<5){ cnt.delete(); continue; }
+
+      const extent = area / (rect.width*rect.height);
+      if(extent < 0.32){ cnt.delete(); continue; }
+
+      const roiMask = finalMask.roi(rect);
+      const cov = cv.countNonZero(roiMask)/(rect.width*rect.height);
+      roiMask.delete();
+      if(cov < 0.05){ cnt.delete(); continue; }
+
+      const peri=cv.arcLength(cnt,true);
+      const circ=(4*Math.PI*area)/(peri*peri+1e-6);
+
+      const hull=new cv.Mat();
+      cv.convexHull(cnt,hull);
+      const hullArea = Math.max(cv.contourArea(hull), 1e-6);
+      const solid=area/hullArea;
+
+      const r2=gray.roi(rect);
+      const m=new cv.Mat(), s=new cv.Mat();
+      cv.meanStdDev(r2,m,s);
+      const meanG=m.doubleAt(0,0);
+      const stdG=s.doubleAt(0,0);
+      r2.delete(); m.delete(); s.delete();
+
+      const brightOK = (meanG > gMean-18 && stdG < 115);
+
+      let isEllipse=false, ex=0,ey=0,er1=0,er2=0,eang=0;
+      try{
+        if(cnt.total && cnt.total()>=5){
+          const rr=cv.fitEllipse(cnt);
+          isEllipse=true;
+          ex=rr.center.x; ey=rr.center.y;
+          er1=rr.size.width/2; er2=rr.size.height/2;
+          eang=rr.angle*Math.PI/180;
+        }
+      }catch{}
+      const aspect = isEllipse ? Math.min(er1,er2)/Math.max(er1,er2) : 1;
+
+      const roundOK = (circ>=0.56 && solid>=0.80 && aspect>=0.66);
+      const capsuleOK = (solid>=0.84 && aspect>=0.22 && aspect<0.82);
+
+      let edgeOK=false, contrastOK=false;
+
+      if(roundOK){
+        const M=cv.moments(cnt);
+        const cxp=M.m10/(M.m00||1), cyp=M.m01/(M.m00||1);
+        const rp=Math.max(6,Math.sqrt(area/Math.PI));
+        edgeOK = ringEdgeOK(cxp,cyp,rp);
+        contrastOK = regionContrastOK(cxp,cyp,rp);
+      }else if(capsuleOK && isEllipse){
+        const rr=Math.max(er1,er2);
+        contrastOK = regionContrastOK(ex,ey,rr);
+      }
+
+      const okShape = (roundOK && (edgeOK || contrastOK)) || (capsuleOK && contrastOK);
+      if(!okShape || !brightOK){ hull.delete(); cnt.delete(); continue; }
+
+      const strong = (solid>0.82 && (edgeOK || (contrastOK && circ>0.52)));
+
+      if(roundOK){
+        const M=cv.moments(cnt);
+        const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
+        const r=Math.max(6,Math.sqrt(area/Math.PI));
+        const Rv=r*Math.sqrt((sX+sY)/2);
+        dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,strong});
+        eqR.push(Rv);
+      }else{
+        const Rv=Math.max(er1*sX,er2*sY);
+        dets.push({type:'ellipse',x:ex*sX,y:ey*sY,r1:er1*sX,r2:er2*sY,a:eang,strong:false});
+        eqR.push(Rv);
+      }
+
+      hull.delete();
+      cnt.delete();
+    }
+
+    // size prior
+    if(eqR.length>=3){
+      const mid = median(eqR.filter(v=>isFinite(v)));
+      sizePrior.Rv = sizePrior.Rv ? (0.7*sizePrior.Rv + 0.3*mid) : mid;
+    }
+
+    const Rv = sizePrior.Rv || expectedRv;
+    const minR = Math.max(5, Rv*0.30);
+    const maxR = Math.min(Math.min(vidW,vidH)*0.18, Rv*3.2);
+
+    // NMS + border guard
+    dets.sort((a,b)=>b.r1-a.r1);
+    const merged=[];
+    const used=new Array(dets.length).fill(false);
+
+    const border = Math.max(10, minR*1.10);
+
+    for(let i=0;i<dets.length;i++){
+      if(used[i]) continue;
+      const a=dets[i];
+      const big=Math.max(a.r1,a.r2), small=Math.min(a.r1,a.r2);
+      if(big>maxR || small<minR*0.55){ used[i]=true; continue; }
+
+      if(a.x<border || a.y<border || a.x>(vidW-border) || a.y>(vidH-border)){ used[i]=true; continue; }
+
+      merged.push(a);
+      used[i]=true;
+
+      for(let j=i+1;j<dets.length;j++){
+        if(used[j]) continue;
+        const b=dets[j];
+        const d=Math.hypot(a.x-b.x,a.y-b.y);
+        const thr=Math.min(Math.max(a.r1,a.r2),Math.max(b.r1,b.r2))*0.52;
+        if(d<thr) used[j]=true;
+      }
+    }
+
+    assignTracks(merged);
+
+    // draw + count
+    octx.clearRect(0,0,overlay.width,overlay.height);
+    octx.lineWidth=3;
+
+    const now=performance.now();
+    let okCount=0;
+
+    for(const t of tracker.tracks){
+      const ok = (t.hits||0) >= HIT_COUNT_MIN && (now-(t.seen||0)) < LIVE_DROP_MS;
+      if(ok) okCount++;
+
+      octx.strokeStyle= ok? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.90)';
+      octx.fillStyle  = ok? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)';
+
+      if(t.type==='ellipse' && Math.abs((t.r1||0)-(t.r2||0))>1){
+        octx.beginPath();
+        octx.ellipse(t.x,t.y,Math.max(6,t.r1||12),Math.max(6,t.r2||12),t.a||0,0,Math.PI*2);
+        octx.stroke();
+      }else{
+        octx.beginPath();
+        octx.arc(t.x,t.y,Math.max(6,t.r1||12),0,Math.PI*2);
+        octx.stroke();
+      }
+      octx.beginPath();
+      octx.arc(t.x,t.y,4,0,Math.PI*2);
+      octx.fill();
+    }
+
+    // smoothing
+    displayHist.push(okCount);
+    while(displayHist.length>DISPLAY_WIN) displayHist.shift();
+    const smoothCount = Math.round(median(displayHist));
+
+    const countingActive = !countGateUntil || (now >= countGateUntil);
+    countEl.textContent = countingActive ? String(smoothCount) : '0';
+
+    updateFps();
+    frameIdx++;
+  }catch(e){
+    console.error(e);
+    showErr(e?.message||String(e));
+  }
+
+  requestAnimationFrame(process);
+}
+
+// OpenCV ready
+window.cv=window.cv||{};
+cv.onRuntimeInitialized=()=>{ startBtn.disabled=false; };
+
+// fallback ready check
+(function(){
+  const readyCheck = ()=> (window.cv && typeof cv.Mat === 'function');
+  if(readyCheck()){ startBtn.disabled = false; return; }
+  let attempts = 0;
+  const timer = setInterval(()=>{
+    if(readyCheck()){ startBtn.disabled=false; clearInterval(timer); }
+    else if(++attempts >= 100){ startBtn.disabled=false; clearInterval(timer); }
+  }, 150);
+})();
+
+startBtn.addEventListener('click', async()=>{
+  startBtn.disabled=true;
+
+  if(!(window.cv && typeof cv.Mat === 'function')){
+    showErr('Computer vision engine is still loading. Try again in a moment.');
+    startBtn.disabled=false;
+    return;
+  }
+
+  const ok=await startCamera();
+  if(ok){
+    const ready=()=>{
+      allocAll();
+      running=true;
+      frameIdx=0;
+      displayHist.length=0;
+      countGateUntil = performance.now() + COUNT_DELAY_MS;
+      countEl.textContent='0';
+      requestAnimationFrame(process);
+    };
+    if(video.readyState>=1) ready();
+    else video.addEventListener('loadedmetadata', ready, {once:true});
+  }else{
+    if(!errEl.textContent) showErr('Could not start the camera. Check HTTPS and browser site settings.');
+  }
+  startBtn.disabled=false;
+});
+
+window.addEventListener('resize', ()=>{ if(video.videoWidth) allocAll(); });
+
+brightEl.addEventListener('input', ()=>{
+  userBright = Number(brightEl.value) | 0;
+  brightVal.textContent = userBright;
+
+  // try hardware exposure comp if available
+  try{
+    if(stream){
+      const track = stream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      if(caps.exposureCompensation){
+        const min=caps.exposureCompensation.min, max=caps.exposureCompensation.max;
+        const mapped = min + (max-min) * ((userBright+60)/120);
+        track.applyConstraints({ advanced:[{ exposureCompensation: mapped }] }).catch(()=>{});
+      }
+    }
+  }catch{}
+});
+
+recountBtn.addEventListener('click', ()=>{
+  frameIdx=0;
+  tracker.tracks.length=0;
+  displayHist.length=0;
+  sizePrior.Rv=null;
+
+  try{
+    cache.nonPaper && cache.nonPaper.delete(); cache.nonPaper=null;
+    cache.paperMask && cache.paperMask.delete(); cache.paperMask=null;
+    cache.glareOnPaper && cache.glareOnPaper.delete(); cache.glareOnPaper=null;
+    cache.grad && cache.grad.delete(); cache.grad=null;
+    cache.gradBin && cache.gradBin.delete(); cache.gradBin=null;
+  }catch{}
+
+  countGateUntil = performance.now() + COUNT_DELAY_MS;
+  countEl.textContent='0';
+});
+
+window.addEventListener('beforeunload', ()=>{
+  try{ stream && stream.getTracks().forEach(t=>t.stop()); }catch{}
+  try{
+    [
+      src,rgb,hsv,lab,gray,blur,bgIllum,norm,maskOtsu,maskAdapt,fused,glareMask,
+      nonPaper,nonPaperDil,paperMask,grad,gradBin,sobelX,sobelY,absX,absY,
+      dt,dtNorm,sureFgF,sureFg,sureBg,unknown,markers,wsMask,plusOne32,contours,hierarchy,hsvMask,
+      kSmall,kBig,clahe
+    ].forEach(m=>{ try{ m && m.delete && m.delete(); }catch{} });
+
+    cache.nonPaper && cache.nonPaper.delete();
+    cache.paperMask && cache.paperMask.delete();
+    cache.glareOnPaper && cache.glareOnPaper.delete();
+    cache.grad && cache.grad.delete();
+    cache.gradBin && cache.gradBin.delete();
+  }catch{}
+});
+</script>
+</body>
+</html>
